@@ -5,6 +5,9 @@ from torch.nn import functional as F
 from ..layers import Block, ConvPyramid, feature_pyramid
 
 
+_MPS_TRACKING_BUFFER_BYTES = 256 * 1024 * 1024
+
+
 def _framewise(operation, features, chunk_size=8):
     return torch.cat([operation(chunk) for chunk in features.split(chunk_size)])
 
@@ -291,10 +294,11 @@ class TrackingHead(nn.Module):
         batch_size, frames, _, height, width = features.shape
         flattened_batch = batch_size * frames
         device = self.fmap_conv.weight.device
+        storage = features.device
         reference = features[:, 0].to(device)
         features = features.flatten(0, 1)
         hidden = torch.empty_like(features)
-        flow = torch.zeros(flattened_batch, 2, height, width)
+        flow = torch.zeros(flattened_batch, 2, height, width, device=storage)
         base = coordinate_grid(1, height, width, device)
         batches = torch.arange(flattened_batch, device=device) // frames
         for start in range(0, flattened_batch, 8):
@@ -303,9 +307,9 @@ class TrackingHead(nn.Module):
             initial = self.hidden_conv(
                 torch.cat((reference[batches[start:stop]], values), dim=1)
             )
-            hidden[start:stop].copy_(initial.cpu())
+            hidden[start:stop].copy_(initial.to(storage))
         del values, initial
-        up_flow = torch.empty(flattened_batch, 2, height * 2, width * 2)
+        up_flow = torch.empty(flattened_batch, 2, height * 2, width * 2, device=storage)
         information = torch.empty_like(up_flow)
         for iteration in range(5):
             inputs = torch.empty_like(features, device=device)
@@ -339,24 +343,24 @@ class TrackingHead(nn.Module):
                 updated = self.refine_transform(
                     torch.cat((refined, hidden[start:stop].to(device)), dim=1)
                 )
-                hidden[start:stop].copy_(updated.cpu())
+                hidden[start:stop].copy_(updated.to(storage))
                 with torch.autocast(device_type=device.type, enabled=False):
                     update = self.flow_head(updated.float())
                     next_flow = flow[start:stop].to(device) + update[:, :2]
-                    flow[start:stop].copy_(next_flow.cpu())
+                    flow[start:stop].copy_(next_flow.to(storage))
                     if iteration == 4:
                         weights = 0.25 * self.upsample_weight(updated.float())
                         coordinates, scores = convex_upsample(
                             next_flow, update[:, 2:], weights
                         )
-                        up_flow[start:stop].copy_(coordinates.cpu())
-                        information[start:stop].copy_(scores.cpu())
+                        up_flow[start:stop].copy_(coordinates.to(storage))
+                        information[start:stop].copy_(scores.to(storage))
                         del weights, coordinates, scores
                 del refined, updated, update, next_flow
             del pyramid
         up_flow = up_flow.reshape(batch_size, frames, 2, height * 2, width * 2)
         up_flow.sub_(up_flow[:, :1].clone())
-        up_flow.add_(coordinate_grid(1, height * 2, width * 2, "cpu")[None])
+        up_flow.add_(coordinate_grid(1, height * 2, width * 2, storage)[None])
         tracks = up_flow.permute(0, 1, 3, 4, 2).to(device)
         information = information.reshape(
             batch_size, frames, 2, height * 2, width * 2
@@ -395,17 +399,33 @@ class Tracker(nn.Module):
                 chunk_size=1,
             )
             if features is None:
-                features = torch.empty(
-                    batch_size * frames, *values.shape[1:], dtype=values.dtype
+                batch_frames = batch_size * frames
+                channels, half_height, half_width = values.shape[1:]
+                # Budget the features and hidden state, coarse flow, and two
+                # full-resolution outputs before keeping them on the GPU.
+                feature_bytes = 2 * channels * values.element_size()
+                flow_bytes = (2 + 2 * 2 * 4) * 4
+                bytes_per_pixel = feature_bytes + flow_bytes
+                buffer_bytes = batch_frames * half_height * half_width * bytes_per_pixel
+                storage = (
+                    values.device
+                    if (
+                        values.device.type == "mps"
+                        and buffer_bytes <= _MPS_TRACKING_BUFFER_BYTES
+                    )
+                    else torch.device("cpu")
                 )
-            features[start:stop].copy_(values.cpu())
+                features = values.new_empty(
+                    (batch_frames, *values.shape[1:]), device=storage
+                )
+            features[start:stop].copy_(values.to(features.device))
             del motion, projected, rgb, values
         features = features.reshape(batch_size, frames, 64, height // 2, width // 2)
         indices = torch.arange(frames, device=tokens.device).expand(batch_size, -1)
         order = (indices + query_frames[:, None]) % frames
         batch_indices = torch.arange(batch_size, device=tokens.device)[:, None]
         tracks, visibility, confidence = self.head(
-            features[batch_indices.cpu(), order.cpu()]
+            features[batch_indices.to(features.device), order.to(features.device)]
         )
         restore = order.argsort(dim=1)
         return (

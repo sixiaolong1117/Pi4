@@ -11,11 +11,12 @@ readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.12.1",
+    "torch==2.12.1; sys_platform != 'darwin'",
+    "torch==2.15.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "safetensors>=0.4",
     "huggingface-hub>=0.27",
     "triton==3.7.1; sys_platform == 'linux'",
-    "flex_gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git@b2fadb29d41846c7981ade6801ffc689fae119cf",
+    "flex_gemm @ git+https://github.com/JeffreyXiang/FlexGEMM.git@b2fadb29d41846c7981ade6801ffc689fae119cf ; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

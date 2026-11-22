@@ -10,7 +10,34 @@ This repository contains one fixed inference model, not a configurable training 
 
 ## Install
 
-CUDA is required for sparse geometry refinement. The recommended setup is Linux
+### Apple Silicon
+
+Use an ARM64 Python 3.13 environment. Pi4 uses PyTorch MPS for inference,
+including sparse geometry refinement, and loads the same Safetensors checkpoint
+as the CUDA build. Tracking buffers stay on MPS when their combined size is
+at most 256 MiB. Larger buffers are staged in CPU memory. Video decoding and
+viewer export use the host CPU.
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[example]'
+python -c "import torch; assert torch.backends.mps.is_available()"
+python example.py examples/figure_skating.mp4 --device mps \
+  --weights yyfz233/Pi4 --max-size 224 --max-frames 2 --query-frame 0 \
+  --output outputs/mac-skating --viewer
+python viewer/serve.py outputs/mac-skating
+```
+
+The example downloads the checkpoint on first use. To run offline, pass a
+local file with `--weights /path/to/model.safetensors`. Start with a short
+sequence, then raise `--max-frames` and `--max-size` as your unified memory
+allows. The CUDA memory and timing tables below were measured on an A800.
+For the Python API, use `.to("mps")` for both the model and the input tensor.
+
+### NVIDIA CUDA
+
+The recommended CUDA setup is Linux
 x86-64, Python 3.11, an NVIDIA GPU with BF16 support, and a CUDA 12.6-compatible
 NVIDIA driver. Install Pi4 inside an isolated environment rather than your
 system Python or an unrelated project's environment. Git is required to install
@@ -89,9 +116,9 @@ must be positive multiples of 16. Normalization and precision handling are
 internal. Tracking requires at least two images. A scalar query index applies to
 the whole batch; an integer tensor shaped `[B]` selects one query per sequence.
 Images are jointly processed, not silently split into temporal windows.
-Independent spatial operators use small frame batches internally, while tracking
-features and recurrent state are staged in CPU RAM. Temporal attention still
-sees the complete sequence; there are no user-facing chunking options.
+Independent spatial operators use small frame batches internally. Tracking
+features and recurrent state are staged in CPU RAM on CUDA and for larger MPS
+sequences. Temporal attention sees the complete sequence.
 
 `from_pretrained` accepts a local Safetensors file, a local directory containing
 `model.safetensors`, or a Hugging Face repository ID with optional `revision=`.
@@ -274,6 +301,7 @@ The example is just image loading, `model(images, query_frame=...)`, and
 `pi4/visualization.py`; they do not change the model's returned tensors. Omit
 `--query-frame` for geometry only. With tracking,
 the query index refers to the sequence **after** input frame sampling.
+`--device auto` is the default and selects CUDA first, then MPS.
 `--max-frames` is optional and defaults to no cap; `--stride` defaults to 1.
 Images are RGB uint8 `[T,H,W,3]` before conversion to the model's floating-point
 `[1,T,3,H,W]` input.

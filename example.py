@@ -22,6 +22,12 @@ def main():
         type=int,
         help="optional limit on sampled input frames (default: all frames)",
     )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "mps"),
+        default="auto",
+        help="inference device (auto selects CUDA, then Apple Silicon MPS)",
+    )
     parser.add_argument("--max-size", type=int, default=512)
     parser.add_argument(
         "--viewer",
@@ -38,6 +44,21 @@ def main():
     from pi4.io import load_images
     from pi4.visualization import save_visualization
 
+    device = arguments.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "mps"
+    available = (
+        torch.cuda.is_available()
+        if device == "cuda"
+        else torch.backends.mps.is_available()
+    )
+    if not available:
+        parser.error(
+            "Pi4 requires CUDA or Apple Silicon MPS"
+            if arguments.device == "auto"
+            else f"Requested device {device!r} is unavailable"
+        )
+
     frames, metadata = load_images(
         arguments.input,
         stride=arguments.stride,
@@ -46,7 +67,7 @@ def main():
     )
     print(
         f"Processing {len(frames)} frames at {frames.shape[2]}x{frames.shape[1]} "
-        f"in one forward (frame cap: {arguments.max_frames or 'all'}, stride: {arguments.stride}).",
+        f"on {device} in one forward (frame cap: {arguments.max_frames or 'all'}, stride: {arguments.stride}).",
         flush=True,
     )
     images = (
@@ -55,9 +76,9 @@ def main():
         .float()
         .div_(255)
         .unsqueeze(0)
-        .cuda()
+        .to(device)
     )
-    model = Pi4.from_pretrained(arguments.weights).cuda()
+    model = Pi4.from_pretrained(arguments.weights).to(device)
     prediction = model(images, query_frame=arguments.query_frame)
     scene = save_visualization(
         arguments.output, frames, prediction, metadata, viewer=arguments.viewer

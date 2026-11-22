@@ -51,6 +51,11 @@ collections, and videos without supplied camera calibration, building a shared
 
 ### 1. Install
 
+On **Apple Silicon**, install the native PyTorch MPS build and start with a
+short clip. See the [macOS quickstart](docs/inference.md#apple-silicon).
+
+For CUDA, use the setup below.
+
 Use **Linux x86-64**, **Python 3.11**, an **NVIDIA GPU with BF16 support**, and a
 CUDA 12.6-compatible NVIDIA driver. Run the commands from the repository root:
 
