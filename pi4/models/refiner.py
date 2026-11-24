@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .sparse import SubmanifoldConv3d, mean_pool, nearest_upsample
-from .sparse_mps import DEPTH_EXTENT, image_neighbor_indices
+from .sparse_mps import DEPTH_EXTENT, image_neighbor_cache
 
 
 class SparseResidual(nn.Module):
@@ -14,8 +14,25 @@ class SparseResidual(nn.Module):
         self.conv1 = SubmanifoldConv3d(channels, algorithm)
         self.conv2 = SubmanifoldConv3d(channels, algorithm)
 
-    def forward(self, features, coordinates, shape, cache=None):
+    def forward(self, features, coordinates, shape, cache=None, *, sorted_coords=False):
         residual = F.silu(self.norm1(features).type_as(features))
+        if features.device.type == "mps":
+            residual, cache = self.conv1(
+                residual,
+                coordinates,
+                shape,
+                cache,
+                activation="silu",
+                sorted_coords=sorted_coords,
+            )
+            return self.conv2(
+                residual,
+                coordinates,
+                shape,
+                cache,
+                residual=features,
+                sorted_coords=sorted_coords,
+            )
         residual, cache = self.conv1(residual, coordinates, shape, cache)
         residual, cache = self.conv2(
             F.silu(residual), coordinates, shape, cache
@@ -93,7 +110,11 @@ class SparseUNet(nn.Module):
         down_caches, skips = [], []
         for index, stage in enumerate(self.down_stages):
             features, caches[index] = stage[0](
-                features, coordinates, shape, caches[index]
+                features,
+                coordinates,
+                shape,
+                caches[index],
+                sorted_coords=index > 0,
             )
             if index < 4:
                 skips.append((features, coordinates, shape))
@@ -109,7 +130,7 @@ class SparseUNet(nn.Module):
         ]
         features = self.fuse_proj(torch.cat((features, sampled), dim=-1))
         features, caches[4] = self.bottleneck_stage[0](
-            features, coordinates, shape, caches[4]
+            features, coordinates, shape, caches[4], sorted_coords=True
         )
         for index, (upsample, stage) in enumerate(
             zip(self.upsample_blocks, self.up_stages)
@@ -125,7 +146,11 @@ class SparseUNet(nn.Module):
                 down_caches[level],
             )
             features, caches[level] = stage[0](
-                features + skip_features, coordinates, shape, caches[level]
+                features + skip_features,
+                coordinates,
+                shape,
+                caches[level],
+                sorted_coords=level > 0,
             )
         return self.out_proj(features)
 
@@ -159,7 +184,7 @@ class DepthRefiner(nn.Module):
             initial_neighbors = None
             if rays.device.type == "mps":
                 extent = DEPTH_EXTENT
-                initial_neighbors = image_neighbor_indices(coordinates, height, width)
+                initial_neighbors = image_neighbor_cache(coordinates, height, width)
             else:
                 extent = int(bins.max().item()) + 1
             shape = torch.Size((batch_size, height, width, extent, 3))

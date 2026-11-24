@@ -9,12 +9,10 @@ from torch.nn import functional as F
 from . import sparse_mps
 
 
-_GATHER_BLOCK_BYTES = 16 * 1024 * 1024
+_GATHER_BLOCK_BYTES = 32 * 1024 * 1024
 
 
 def _neighbor_indices(coordinates, shape):
-    if coordinates.device.type == "mps" and len(coordinates):
-        return sparse_mps.neighbor_indices(coordinates, shape)
     _, height, width, depth, _ = shape
     # A one-voxel border keeps out-of-bounds offsets from wrapping to an active key.
     column_stride = depth + 2
@@ -49,11 +47,21 @@ class SubmanifoldConv3d(nn.Module):
         nn.init.uniform_(self.weight, -bound, bound)
         nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, features, coordinates, shape, cache):
+    def forward(
+        self,
+        features,
+        coordinates,
+        shape,
+        cache,
+        *,
+        activation=None,
+        residual=None,
+        sorted_coords=False,
+    ):
         if features.is_cuda:
             from flex_gemm.ops.spconv.submanifold_conv import submanifold_conv3d
 
-            return submanifold_conv3d(
+            output, cache = submanifold_conv3d(
                 features,
                 coordinates,
                 shape,
@@ -62,6 +70,34 @@ class SubmanifoldConv3d(nn.Module):
                 neighbor_cache=cache,
                 algorithm=self.algorithm,
             )
+            if activation == "silu":
+                output = F.silu(output)
+            elif residual is not None:
+                output = output + residual
+            return output, cache
+
+        if len(features) == 0:
+            return features.clone(), cache
+
+        if (
+            features.device.type == "mps"
+            and features.dtype == torch.float32
+            and features.shape[1] % 32 == 0
+            and (cache is None or isinstance(cache, sparse_mps.MPSNeighborCache))
+        ):
+            if cache is None:
+                cache = sparse_mps.neighbor_cache(
+                    coordinates, shape, sorted_coords=sorted_coords
+                )
+            output = sparse_mps.submanifold_conv3d(
+                features,
+                self.weight,
+                self.bias,
+                cache,
+                activation=activation,
+                residual=residual,
+            )
+            return output, cache
 
         if cache is None:
             cache = _neighbor_indices(coordinates, shape)
@@ -71,8 +107,7 @@ class SubmanifoldConv3d(nn.Module):
             and features.shape[1] % 4 == 0
         )
         weights = self.weight.flatten(1)
-        # Gather the complete kernel footprint for a bounded block of output voxels.
-        # One GEMM then replaces the separate gathers and additions for each offset.
+        weights_t = weights.T
         bytes_per_row = weights.shape[1] * features.element_size()
         block_rows = max(1, _GATHER_BLOCK_BYTES // bytes_per_row)
         if use_metal_gather:
@@ -91,7 +126,11 @@ class SubmanifoldConv3d(nn.Module):
                 sparse_mps.gather_neighbors(source, indices, neighbors)
             else:
                 neighbors = source.index_select(0, indices).reshape(stop - start, -1)
-            output[start:stop] = F.linear(neighbors, weights, self.bias)
+            torch.addmm(self.bias, neighbors, weights_t, out=output[start:stop])
+        if activation == "silu":
+            output = F.silu(output)
+        elif residual is not None:
+            output = output + residual
         return output, cache
 
 
@@ -108,6 +147,14 @@ def mean_pool(features, coordinates, shape, output_shape):
             reduce="mean",
             output_shape=output_shape,
         )
+
+    if (
+        features.device.type == "mps"
+        and features.dtype == torch.float32
+        and features.shape[1] % 4 == 0
+        and len(coordinates) > 0
+    ):
+        return sparse_mps.mean_pool(features, coordinates, output_shape)
 
     _, height, width, depth, _ = output_shape
     batch = coordinates[:, 0].long()
